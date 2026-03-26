@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const dialogflow = require('@google-cloud/dialogflow');
 
 const app = express();
 
@@ -7,18 +8,151 @@ app.use(cors());
 app.use(express.json());
 
 /* ============================================================
-   LoanIQ Webhook — Bug-Fixed Version
-   Bugs fixed:
-   1. Employment button labels not matching entity values
-      ("Unemployed" button → entity value is "student_unemployed")
-   2. Property area "Semi-Urban" button → entity value is "semiurban"
-   3. purposeMap missing "home_renovation" and "medical" entries
-   4. Context params include ".original" suffixed keys — filtered out
-   5. agent.json had webhook.available = false (blanked URL)
-      → Fixed in agent.json separately
+   LoanIQ Webhook + Chat Proxy
+   
+   /webhook  — Dialogflow fulfillment (called BY Dialogflow)
+   /chat     — Frontend proxy (calls Dialogflow detectIntent)
    ============================================================ */
 
-/* ---------------- EMI CALCULATION ---------------- */
+/* ─────────────── DIALOGFLOW CLIENT ─────────────── */
+
+// Parse service account from environment variable
+let dfClient = null;
+let projectId = null;
+
+try {
+  const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS || '{}');
+  projectId = creds.project_id || process.env.DIALOGFLOW_PROJECT_ID;
+  
+  if (creds.client_email) {
+    dfClient = new dialogflow.SessionsClient({
+      credentials: {
+        client_email: creds.client_email,
+        private_key: creds.private_key,
+      },
+      projectId: projectId,
+    });
+    console.log('✅ Dialogflow client initialized for project:', projectId);
+  } else {
+    console.warn('⚠️ GOOGLE_CREDENTIALS not set — /chat endpoint will be unavailable');
+  }
+} catch (e) {
+  console.error('❌ Failed to parse GOOGLE_CREDENTIALS:', e.message);
+}
+
+/* ─────────────── /chat — FRONTEND PROXY ─────────────── */
+
+app.post('/chat', async (req, res) => {
+  if (!dfClient || !projectId) {
+    return res.status(500).json({
+      error: 'Dialogflow not configured. Set GOOGLE_CREDENTIALS env var.',
+    });
+  }
+
+  const { text, sessionId } = req.body;
+  
+  if (!text || !sessionId) {
+    return res.status(400).json({ error: 'Missing text or sessionId' });
+  }
+
+  try {
+    const sessionPath = dfClient.projectAgentSessionPath(projectId, sessionId);
+
+    const [response] = await dfClient.detectIntent({
+      session: sessionPath,
+      queryInput: {
+        text: {
+          text: text,
+          languageCode: 'en',
+        },
+      },
+    });
+
+    const qr = response.queryResult;
+
+    // Extract texts and quick replies
+    const messages = [];
+    const chips = [];
+
+    if (qr.fulfillmentMessages) {
+      qr.fulfillmentMessages.forEach(m => {
+        if (m.text && m.text.text) {
+          m.text.text.filter(Boolean).forEach(t => messages.push(t));
+        }
+        if (m.quickReplies && m.quickReplies.quickReplies) {
+          chips.push(...m.quickReplies.quickReplies);
+        }
+      });
+    }
+
+    if (messages.length === 0 && qr.fulfillmentText) {
+      messages.push(qr.fulfillmentText);
+    }
+
+    return res.json({
+      texts: messages,
+      chips: chips,
+      intent: qr.intent?.displayName || '',
+    });
+  } catch (error) {
+    console.error('Dialogflow detectIntent error:', error.message);
+    return res.status(500).json({ error: 'Failed to process message' });
+  }
+});
+
+/* ─────────────── /chat/welcome — WELCOME EVENT ─────────────── */
+
+app.post('/chat/welcome', async (req, res) => {
+  if (!dfClient || !projectId) {
+    return res.status(500).json({ error: 'Dialogflow not configured' });
+  }
+
+  const { sessionId } = req.body;
+  if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+
+  try {
+    const sessionPath = dfClient.projectAgentSessionPath(projectId, sessionId);
+
+    const [response] = await dfClient.detectIntent({
+      session: sessionPath,
+      queryInput: {
+        event: {
+          name: 'WELCOME',
+          languageCode: 'en',
+        },
+      },
+    });
+
+    const qr = response.queryResult;
+    const messages = [];
+    const chips = [];
+
+    if (qr.fulfillmentMessages) {
+      qr.fulfillmentMessages.forEach(m => {
+        if (m.text && m.text.text) {
+          m.text.text.filter(Boolean).forEach(t => messages.push(t));
+        }
+        if (m.quickReplies && m.quickReplies.quickReplies) {
+          chips.push(...m.quickReplies.quickReplies);
+        }
+      });
+    }
+
+    if (messages.length === 0 && qr.fulfillmentText) {
+      messages.push(qr.fulfillmentText);
+    }
+
+    return res.json({ texts: messages, chips: chips });
+  } catch (error) {
+    console.error('Welcome event error:', error.message);
+    return res.status(500).json({ error: 'Failed to get welcome message' });
+  }
+});
+
+
+/* ============================================================
+   EMI CALCULATION
+   ============================================================ */
 
 function calculateEMI(principal, annualRate = 9, tenureMonths = 240) {
   const monthlyRate = annualRate / (12 * 100);
@@ -28,7 +162,9 @@ function calculateEMI(principal, annualRate = 9, tenureMonths = 240) {
   return emi;
 }
 
-/* ---------------- LOAN ELIGIBILITY ENGINE ---------------- */
+/* ============================================================
+   LOAN ELIGIBILITY ENGINE
+   ============================================================ */
 
 function calculateLoanEligibility(params) {
   let score = 0;
@@ -45,12 +181,11 @@ function calculateLoanEligibility(params) {
   const age          = parseFloat(params.age);
   const dependents   = parseFloat(params.dependents || 0);
 
-  /* -------- EMI + DTI -------- */
   const proposedEMI = calculateEMI(loanAmt);
   const totalEMI    = existingEMI + proposedEMI;
   const dtiRatio    = totalIncome > 0 ? (totalEMI / totalIncome) * 100 : 100;
 
-  /* -------- CREDIT SCORE (30 pts) -------- */
+  // CREDIT SCORE (30 pts)
   if (creditScore >= 750) {
     score += 30;
   } else if (creditScore >= 700) {
@@ -65,7 +200,7 @@ function calculateLoanEligibility(params) {
     tips.push('Pay down existing debts and clear any overdue EMIs to improve CIBIL');
   }
 
-  /* -------- DTI RATIO (25 pts) -------- */
+  // DTI RATIO (25 pts)
   if (dtiRatio <= 30) {
     score += 25;
   } else if (dtiRatio <= 40) {
@@ -81,7 +216,7 @@ function calculateLoanEligibility(params) {
     tips.push('Reduce loan amount or clear existing debts before applying');
   }
 
-  /* -------- INCOME vs LOAN AMOUNT (20 pts) -------- */
+  // INCOME vs LOAN AMOUNT (20 pts)
   const ratio = loanAmt / totalIncome;
   if (ratio <= 20) {
     score += 20;
@@ -97,29 +232,23 @@ function calculateLoanEligibility(params) {
     tips.push('Reduce the requested loan amount or increase co-applicant income');
   }
 
-  /* -------- EMPLOYMENT TYPE (10 pts) -------- */
-  // BUG FIX 1: Added all entity canonical values AND common button-label variants
-  // Dialogflow normalises to entity values, but we also handle raw labels defensively
+  // EMPLOYMENT TYPE (10 pts)
   const empMap = {
-    // Canonical entity values from employment-type_entries_en.json
     salaried_government : 10,
     salaried_private    : 8,
     self_employed       : 6,
     freelancer          : 4,
     student_unemployed  : 1,
-    // Defensive fallbacks for raw button labels (in case entity resolution fails)
     'salaried govt'     : 10,
     'salaried private'  : 8,
     'self-employed'     : 6,
     unemployed          : 1,
     student             : 1,
   };
-
-  // Normalise: lowercase + trim before lookup
   const empKey = String(params.employment_status || '').toLowerCase().trim();
-  score += empMap[empKey] ?? 4;   // 4 = safe default for unknown values
+  score += empMap[empKey] ?? 4;
 
-  /* -------- AGE (5 pts) -------- */
+  // AGE (5 pts)
   if (age >= 25 && age <= 45) {
     score += 5;
   } else if (age >= 21 && age <= 55) {
@@ -130,22 +259,20 @@ function calculateLoanEligibility(params) {
     if (age > 55)  warnings.push('Age above 55 — shorter available tenure may reduce eligibility');
   }
 
-  /* -------- LOAN PURPOSE (5 pts) -------- */
-  // BUG FIX 3: Added home_renovation and medical which were missing
+  // LOAN PURPOSE (5 pts)
   const purposeMap = {
     home_purchase    : 5,
     education        : 4,
     vehicle          : 4,
     business         : 3,
-    home_renovation  : 3,   // ← was missing
+    home_renovation  : 3,
     personal         : 2,
-    medical          : 2,   // ← was missing
+    medical          : 2,
   };
-
   const purposeKey = String(params.loan_purpose || '').toLowerCase().trim();
   score += purposeMap[purposeKey] ?? 2;
 
-  /* -------- DEPENDENTS (3 pts) -------- */
+  // DEPENDENTS (3 pts)
   if (dependents === 0) {
     score += 3;
   } else if (dependents <= 2) {
@@ -155,23 +282,20 @@ function calculateLoanEligibility(params) {
     if (dependents > 3) warnings.push('High number of dependents reduces disposable income assessment');
   }
 
-  /* -------- PROPERTY AREA (2 pts) -------- */
-  // BUG FIX 2: Added "semi-urban" and "semi_urban" as keys alongside "semiurban"
+  // PROPERTY AREA (2 pts)
   const areaMap = {
     urban       : 2,
-    semiurban   : 2,   // canonical entity value
-    'semi-urban': 2,   // ← button label variant
-    semi_urban  : 2,   // ← underscore variant
+    semiurban   : 2,
+    'semi-urban': 2,
+    semi_urban  : 2,
     rural       : 1,
   };
-
   const areaKey = String(params.property_area || '').toLowerCase().trim();
   score += areaMap[areaKey] ?? 1;
 
-  /* -------- FINAL SCORE -------- */
+  // FINAL
   const percentage = Math.min(Math.round(score), 100);
 
-  /* -------- VERDICT -------- */
   let verdict, recommendation;
   if (percentage >= 80) {
     verdict        = '✅ Strong Approval Likely';
@@ -191,18 +315,12 @@ function calculateLoanEligibility(params) {
   }
 
   return {
-    percentage,
-    verdict,
-    recommendation,
-    warnings,
-    tips,
-    dtiRatio  : dtiRatio.toFixed(1),
-    totalIncome,
-    emi       : Math.round(proposedEMI),
+    percentage, verdict, recommendation, warnings, tips,
+    dtiRatio: dtiRatio.toFixed(1), totalIncome, emi: Math.round(proposedEMI),
   };
 }
 
-/* ---------------- FORMAT MONEY ---------------- */
+/* ─────────────── FORMAT MONEY ─────────────── */
 
 function formatCurrency(amount) {
   const n = parseFloat(amount);
@@ -212,22 +330,19 @@ function formatCurrency(amount) {
   return `₹${n}`;
 }
 
-/* ---------------- WEBHOOK ---------------- */
+/* ============================================================
+   /webhook — DIALOGFLOW FULFILLMENT
+   ============================================================ */
 
 app.post('/webhook', (req, res) => {
   const intentName     = req.body?.queryResult?.intent?.displayName;
   const parameters     = req.body?.queryResult?.parameters || {};
   const outputContexts = req.body?.queryResult?.outputContexts || [];
 
-  // Merge parameters from all output contexts (this is where Dialogflow
-  // carries parameters across the multi-turn conversation)
   let allParams = { ...parameters };
 
   outputContexts.forEach(ctx => {
     if (ctx.parameters) {
-      // BUG FIX 4: Filter out ".original" suffix keys that Dialogflow injects
-      // (e.g. "age.original": "28") — these are string representations and
-      // would shadow the correctly typed numeric values if merged blindly.
       const clean = {};
       Object.entries(ctx.parameters).forEach(([k, v]) => {
         if (!k.endsWith('.original')) clean[k] = v;
@@ -258,7 +373,6 @@ app.post('/webhook', (req, res) => {
     const filled = Math.round(percentage / 10);
     const bar    = '█'.repeat(filled) + '░'.repeat(10 - filled);
 
-    /* Message 1 — Score card */
     const msg1 =
 `LOAN ELIGIBILITY RESULT
 
@@ -271,7 +385,6 @@ Loan: ${formatCurrency(allParams.loan_amount)}
 EMI: ${formatCurrency(emi)}/month
 DTI: ${dtiRatio}%`;
 
-    /* Message 2 — Verdict + warnings */
     let msg2 = recommendation;
     if (warnings.length > 0) {
       msg2 =
@@ -286,7 +399,6 @@ ${recommendation}`;
       { text: { text: [msg2] } },
     ];
 
-    /* Message 3 — Improvement tips (only if any) */
     if (tips.length > 0) {
       const msg3 =
 `💡 How to Improve Your Chances:
@@ -295,7 +407,6 @@ ${tips.slice(0, 3).map((t, i) => `${i + 1}. ${t}`).join('\n')}`;
       messages.push({ text: { text: [msg3] } });
     }
 
-    /* Quick reply buttons */
     messages.push({
       quickReplies: {
         quickReplies: ['Check Again 🔄', 'Improve Score 📈', 'Loan Tips 💡'],
@@ -315,11 +426,11 @@ ${tips.slice(0, 3).map((t, i) => `${i + 1}. ${t}`).join('\n')}`;
   }
 });
 
-/* ---------------- HEALTH CHECK ---------------- */
+/* ─────────────── HEALTH CHECK ─────────────── */
 
 app.get('/', (req, res) => res.send('LoanIQ Webhook Running ✅'));
 
-/* ---------------- SERVER ---------------- */
+/* ─────────────── SERVER ─────────────── */
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`LoanIQ webhook running on port ${PORT}`));
