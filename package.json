@@ -6,14 +6,3 @@
     "express": "^4.18.2"
   }
 }
-```
-
-6. Click **"Commit changes"** → **"Commit directly to main"** → **Commit**
-
----
-
-Then go back to Render → open your `loaniq-webhook` service → click **"Manual Deploy" → "Deploy latest commit"**
-
-The build will re-run and should succeed this time. Watch for:
-```
-LoanIQ webhook running on port 10000
