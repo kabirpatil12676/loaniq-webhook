@@ -8,29 +8,12 @@
 }
 ```
 
-Drag both files into GitHub → click **"Commit changes"**
+6. Click **"Commit changes"** → **"Commit directly to main"** → **Commit**
 
 ---
 
-## Step 3 — Back on Render
+Then go back to Render → open your `loaniq-webhook` service → click **"Manual Deploy" → "Deploy latest commit"**
 
-1. Your new `loaniq-webhook` repo will now appear in the list (refresh if needed)
-2. Click it to select it
-3. Fill in the settings:
-   - **Name:** `loaniq-webhook`
-   - **Region:** any (pick closest to India — Singapore)
-   - **Branch:** `main`
-   - **Runtime:** `Node`
-   - **Build Command:** `npm install`
-   - **Start Command:** `node index.js`
-   - **Instance Type:** Free
-4. Click **"Deploy Web Service"**
-5. Wait ~2 minutes → you'll get a URL like `https://loaniq-webhook.onrender.com`
-
----
-
-## Step 4 — Verify it works
-
-Open your Render URL in browser → should show:
+The build will re-run and should succeed this time. Watch for:
 ```
-LoanIQ Webhook is running ✅
+LoanIQ webhook running on port 10000
