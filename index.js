@@ -433,6 +433,16 @@ app.get('/', (req, res) => res.send('LoanIQ Webhook Running ✅'));
 /* ─────────────── SERVER ─────────────── */
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`LoanIQ webhook running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`LoanIQ webhook running on port ${PORT}`);
+
+  // Self-ping every 13 minutes to prevent Render free tier from sleeping
+  const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `https://loaniq-webhook.onrender.com`;
+  setInterval(() => {
+    fetch(RENDER_URL)
+      .then(() => console.log('Keep-alive ping sent'))
+      .catch(() => {});
+  }, 13 * 60 * 1000); // 13 minutes
+});
 
 module.exports = app;
